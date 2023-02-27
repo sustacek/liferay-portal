@@ -21,70 +21,145 @@ import com.liferay.portal.kernel.log.Log;
 import com.liferay.portal.kernel.log.LogFactoryUtil;
 
 import java.io.IOException;
-
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
-
+import java.util.AbstractMap;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
 
 /**
  * @author Jiaxu Wei
+ * @author Josef Sustacek
  */
 public class EnvPropertiesUtil {
 
 	public static void loadEnvOverrides(
-		String envPrefix, long companyId,
+		String liferayEnvPropsPrefix, long companyId,
 		BiConsumer<String, String> biConsumer) {
-
-		String companyEnvPrefix = envPrefix.concat(_PROPS_BY_COMPANY);
 
 		Map<String, String> env = System.getenv();
 
-		for (Map.Entry<String, String> entry : env.entrySet()) {
-			String key = entry.getKey();
+		_loadEnvOverrides(liferayEnvPropsPrefix, companyId, biConsumer, env);
+	}
 
-			if (!key.startsWith(envPrefix)) {
+	private static void _loadEnvOverrides(
+			String liferayEnvPropsPrefix, long companyId,
+			BiConsumer<String, String> biConsumer, Map<String, String> env) {
+
+		String allCompaniesEnvPropKey = liferayEnvPropsPrefix.concat(
+			_PROPS_FOR_ALL_COMPANIES);
+		String byCompanyEnvPrefix =
+			liferayEnvPropsPrefix.concat(_PROPS_BY_COMPANY);
+		String byCompanyEnvPropKey =
+			byCompanyEnvPrefix.concat(String.valueOf(companyId));
+
+		// <liferayEnvPropsPrefix>_PROPS=key1=value1\nkey2=value2
+		// only exact match, no suffixes supported:
+		// 		LIFERAY_PROPS=key1=value1\nkey2=value2
+		Optional<Map.Entry<String, String>> allCompaniesEnvProp =
+			Optional.ofNullable(
+				env.containsKey(allCompaniesEnvPropKey)
+					? new AbstractMap.SimpleEntry<>(
+						allCompaniesEnvPropKey, env.get(allCompaniesEnvPropKey))
+					: null);
+			
+
+		// <liferayEnvPropsPrefix>_PROPS_BY_COMPANY_<company_id>*=key1=value1\nkey2=value2
+		// only exact match, no suffixes supported:
+		// 		LIFERAY_PROPS_BY_COMPANY_10025=key1=value1\nkey2=value2
+		Optional<Map.Entry<String, String>> givenCompanyEnvProp =
+			Optional.ofNullable(
+				env.containsKey(byCompanyEnvPropKey)
+					? new AbstractMap.SimpleEntry<>(
+						byCompanyEnvPropKey, env.get(byCompanyEnvPropKey))
+					: null);
+
+		// <liferayEnvPropsPrefix>_<encoded_key1>=value1
+		// 		LIFERAY_<encoded_key1>=value1
+		// 		LIFERAY_<encoded_key2>=value2
+		Map<String, String> decodableEnvProps =
+			env.entrySet().stream()
+				.filter(x ->
+					x.getKey().startsWith(liferayEnvPropsPrefix)
+					&& !x.getKey().startsWith(allCompaniesEnvPropKey)
+					&& !x.getKey().startsWith(byCompanyEnvPrefix))
+				.collect(
+					Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+		// the order is important, multiple ENV vars might configure the same Liferay portal / system property
+
+		_loadCompanyCompositeOverrides(
+			allCompaniesEnvProp, companyId, biConsumer);
+		_loadCompanyCompositeOverrides(
+			givenCompanyEnvProp, companyId, biConsumer);
+		_loadDecodableOverrides(
+			decodableEnvProps, liferayEnvPropsPrefix, companyId, biConsumer);
+	}
+
+	private static void _loadCompanyCompositeOverrides(
+		Optional<Map.Entry<String, String>> companyPropertiesEnvProp,
+		long companyId, BiConsumer<String, String> biConsumer) {
+
+		if (companyPropertiesEnvProp.isPresent()) {
+			String envPropKey = companyPropertiesEnvProp.get().getKey();
+			String envPropValue = companyPropertiesEnvProp.get().getValue();
+
+			try {
+				Properties properties = PropertiesUtil.load(envPropValue);
+
+				properties.forEach(
+					(portalPropKey, portalPropValue) ->  {
+						biConsumer.accept(
+							String.valueOf(portalPropKey),
+							String.valueOf(portalPropValue));
+
+						if (_log.isInfoEnabled()) {
+							_log.info(
+								StringBundler.concat(
+									"Overrode property ",
+									String.valueOf(portalPropKey),
+									" for companyId ", companyId,
+									" with the value from the environment variable ",
+									envPropKey));
+						}
+					});
+			}
+			catch (IOException ioException) {
+				ReflectionUtil.throwException(ioException);
+			}
+		}
+	}
+
+	private static void _loadDecodableOverrides(
+		Map<String, String> decodableEnvVars,
+		String liferayEnvPropsPrefix, long companyId,
+		BiConsumer<String, String> biConsumer) {
+
+		for (Map.Entry<String, String> entry : decodableEnvVars.entrySet()) {
+			String envPropKey = entry.getKey();
+			String envPropValue = entry.getValue();
+
+			String decodedPortalPropKey = _decode(
+				StringUtil.toLowerCase(
+					envPropKey.substring(liferayEnvPropsPrefix.length())));
+
+			if (decodedPortalPropKey.equals("include-and-override")) {
 				continue;
 			}
 
-			if (key.startsWith(companyEnvPrefix)) {
-				if (companyId == GetterUtil.getLong(
-						key.substring(companyEnvPrefix.length()), -1)) {
-
-					try {
-						Properties properties = PropertiesUtil.load(
-							entry.getValue());
-
-						properties.forEach(
-							(propertyKey, propertyValue) -> biConsumer.accept(
-								String.valueOf(propertyKey),
-								String.valueOf(propertyValue)));
-					}
-					catch (IOException ioException) {
-						ReflectionUtil.throwException(ioException);
-					}
-				}
-
-				continue;
-			}
-
-			String newKey = _decode(
-				StringUtil.toLowerCase(key.substring(envPrefix.length())));
-
-			if (newKey.equals("include-and-override")) {
-				continue;
-			}
-
-			biConsumer.accept(newKey, entry.getValue());
+			biConsumer.accept(decodedPortalPropKey, envPropValue);
 
 			if (_log.isInfoEnabled()) {
 				_log.info(
 					StringBundler.concat(
-						"Overrode property ", newKey,
-						" with the value from the environment variable ", key));
+						"Overrode property ", decodedPortalPropKey,
+						" for companyId ", companyId,
+						" with the value from the environment variable ",
+						envPropKey));
 			}
 		}
 	}
@@ -163,6 +238,7 @@ public class EnvPropertiesUtil {
 	}
 
 	private static final String _PROPS_BY_COMPANY = "PROPS_BY_COMPANY_";
+	private static final String _PROPS_FOR_ALL_COMPANIES = "PROPS";
 
 	private static final Log _log = LogFactoryUtil.getLog(
 		EnvPropertiesUtil.class);
